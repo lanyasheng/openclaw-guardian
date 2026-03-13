@@ -601,6 +601,39 @@ RECOVERED=0
     fi
 }
 
+
+# --- Step 0.5: Log rotation + Chrome orphan cleanup (runs every heartbeat) ---
+
+# Log rotation: auto-rotate logs >10MB
+for logf in "$LOG_DIR/gateway.err.log" "$LOG_DIR/gateway.log" "$LOG_DIR/browser-launcher.log"; do
+    if [[ -f "$logf" ]]; then
+        sz=$(stat -f%z "$logf" 2>/dev/null || echo 0)
+        if (( sz > 10485760 )); then
+            mv "$logf" "${logf}.1"
+            : > "$logf"
+            log "[LOG-ROTATE] Rotated $(basename "$logf") (was $(( sz / 1048576 ))MB)"
+        fi
+    fi
+done
+# Clean rotated logs older than 7 days
+find "$LOG_DIR" -name '*.log.1' -mtime +7 -delete 2>/dev/null
+
+# Chrome orphan cleanup: kill PPID=1 Chrome instances not used by Gateway
+if [[ -n "$GW_PID" ]]; then
+    GW_CHROME_PID=$(ps -eo pid,ppid,comm 2>/dev/null | awk -v gw="$GW_PID" '$2==gw && $3~/Google/ {print $1; exit}')
+    for chrome_pid in $(ps -eo pid,ppid,comm 2>/dev/null | awk '$3~/Google Chrome/ && $2==1 {print $1}'); do
+        if [[ -n "$GW_CHROME_PID" ]] && [[ "$chrome_pid" == "$GW_CHROME_PID" ]]; then
+            continue
+        fi
+        child_count=$(ps -eo ppid 2>/dev/null | awk -v p="$chrome_pid" '$1==p' | wc -l | tr -d ' ')
+        if (( child_count > 10 )); then
+            ps -eo pid,ppid 2>/dev/null | awk -v p="$chrome_pid" '$2==p {print $1}' | while read cpid; do kill -9 "$cpid" 2>/dev/null; done
+            kill -9 "$chrome_pid" 2>/dev/null
+            log "[CHROME-GC] Killed orphan Chrome PID=$chrome_pid (had $child_count children)"
+        fi
+    done
+fi
+
 # ─── Step 1: PID 状态检查 ───
 pid_status=$(check_pid_status)
 log "[INFO] PID status: $pid_status"
