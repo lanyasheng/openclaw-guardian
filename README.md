@@ -1,34 +1,70 @@
-# openclaw-guardian
+<p align="center">
+  <h1 align="center">OpenClaw Guardian</h1>
+  <p align="center">
+    Three-layer self-healing system for OpenClaw Gateway<br/>
+    OpenClaw 网关三层自愈系统
+  </p>
+</p>
 
-OpenClaw Gateway 的三层自愈系统。6 个 AI Agent 7×24 全天候运行，自动恢复了 40 多次，手动修了 3 次。
+<p align="center">
+  <a href="#quick-start--快速开始">Quick Start</a> •
+  <a href="#architecture--架构">Architecture</a> •
+  <a href="#scripts--脚本说明">Scripts</a> •
+  <a href="#configuration--配置">Configuration</a> •
+  <a href="#testing--测试">Testing</a>
+</p>
 
-> 详细踩坑经历和设计思路见 [OpenClaw 7×24 生存指南](./docs/article.md)
+---
 
-## 这是什么
+## What is this / 这是什么
 
-跑 OpenClaw 多 Agent 系统时，Gateway 会因为各种原因挂掉：配置被 Agent 改坏了、ACP 子进程泄漏导致 OOM、API 额度耗尽、Chrome 僵死... macOS 自带的 launchd 只管进程活着，不管业务健不健康。这套脚本补上了缺失的部分。
+Running multiple AI agents 24/7 with [OpenClaw](https://github.com/nicepkg/openclaw) is straightforward — until things break at 3 AM. macOS `launchd` restarts crashed processes, but it can't detect a gateway that's alive yet unresponsive, fix a corrupted config, or clean up orphaned child processes eating all your RAM.
 
-## 架构
+This project fills those gaps with a battle-tested, cron-based monitoring system. It has automatically recovered from 40+ incidents over half a month of continuous operation with 6 agents.
 
-三层，各司其职：
+用 [OpenClaw](https://github.com/nicepkg/openclaw) 跑 6 个 AI Agent 全天候运行很简单——直到凌晨 3 点出事。macOS 的 `launchd` 只管进程是否存活，无法检测网关"假活"、修复被 Agent 改坏的配置、或清理吃光内存的孤儿进程。
+
+本项目用 cron 定时任务实现了经过实战检验的自愈系统。半个月内自动恢复了 40 多次故障，覆盖 6 个 Agent 的全天候运行。
+
+> **Blog post / 详细踩坑经历**: [OpenClaw 7×24 生存指南](https://mp.weixin.qq.com/s/xxx) *(coming soon)*
+
+## Architecture / 架构
+
+Three layers, each with a clear responsibility:
+
+三层架构，各司其职：
+
+| Layer | Component | Responsibility |
+|-------|-----------|----------------|
+| **L1 System** | macOS `launchd` | Process dies → restart within 30s |
+| **L2 Application** | `heartbeat-guardian.sh` | Health checks → smart repair → config rollback → orphan cleanup → OOM protection |
+| **L3 Data** | Maintenance scripts | Memory compaction, cron health, Chrome repair, upgrade protection |
 
 | 层级 | 组件 | 职责 |
 |------|------|------|
-| **L1 系统级** | macOS launchd | 进程挂了 → 30s 拉起 |
-| **L2 应用级** | heartbeat-guardian.sh | HTTP+RPC 健康检查 → 智能修复 → 配置回滚 → 孤儿清理 → OOM 保护 |
+| **L1 系统级** | macOS `launchd` | 进程挂了 → 30s 内拉起 |
+| **L2 应用级** | `heartbeat-guardian.sh` | 健康检查 → 智能修复 → 配置回滚 → 孤儿清理 → OOM 保护 |
 | **L3 数据级** | 维护脚本群 | 记忆压缩 / Cron 健康 / Chrome 修复 / 升级保护 |
 
-**核心决策：运维脚本跑在系统 crontab 上，不依赖 OpenClaw Gateway。**
+**Key design decision**: All monitoring runs via system crontab, completely independent of the OpenClaw Gateway. The guardian never depends on the thing it guards.
 
-## 快速开始
+**核心设计决策**：所有运维脚本跑在系统 crontab 上，完全不依赖 OpenClaw Gateway。守护者绝不依赖被守护的对象。
 
-### 1. 安装
+## Quick Start / 快速开始
+
+### Prerequisites / 前置要求
+
+- macOS with `launchd` (recommended) or any Unix with cron
+- [OpenClaw](https://github.com/nicepkg/openclaw) installed and configured
+- Bash 4+ and Python 3.9+
+
+### Install / 安装
 
 ```bash
-git clone https://github.com/your-username/openclaw-guardian.git
+git clone https://github.com/lanyasheng/openclaw-guardian.git
 cd openclaw-guardian
 
-# 复制脚本到 OpenClaw 目录
+# Copy scripts to OpenClaw directory
 cp scripts/heartbeat-guardian.sh ~/.openclaw/scripts/
 cp scripts/memory_maintenance.py ~/.openclaw/scripts/
 cp scripts/check_cron_health.py ~/.openclaw/scripts/
@@ -37,82 +73,98 @@ cp scripts/upgrade-openclaw.sh ~/.openclaw/scripts/
 chmod +x ~/.openclaw/scripts/*.sh
 ```
 
-### 2. 配置 crontab
+### Configure crontab / 配置定时任务
 
 ```bash
 crontab -e
 ```
 
-添加：
+Add the following entries / 添加以下条目：
 
-```bash
-# L2 心跳 — 每 5 分钟
+```cron
+# L2 Heartbeat — every 5 minutes / 每 5 分钟
 */5 * * * * /bin/bash ~/.openclaw/scripts/heartbeat-guardian.sh
 
-# L3 记忆维护 — 每周日凌晨 4 点
+# L3 Memory maintenance — every Sunday 4 AM / 每周日凌晨 4 点
 0 4 * * 0 python3 ~/.openclaw/scripts/memory_maintenance.py --all --broadcast
 
-# L3 日报同步 — 每天 21:45（可选）
-# 45 21 * * * /bin/bash ~/.openclaw/scripts/daily-reports-sync.sh
+# L3 Cron health — every 30 minutes / 每 30 分钟
+*/30 * * * * python3 ~/.openclaw/scripts/check_cron_health.py
 ```
 
-### 3. 验证
+### Verify / 验证
 
 ```bash
-# Dry run（不执行修复）
+# Dry run (no actual repairs)
 bash ~/.openclaw/scripts/heartbeat-guardian.sh --dry-run
 
-# 运行测试
+# Run tests
 bash tests/test-guardian.sh
 ```
 
-## 脚本说明
+## Scripts / 脚本说明
+
+| Script | Lines | Purpose |
+|--------|-------|---------|
+| `heartbeat-guardian.sh` | 800+ | **Core**. Step 0 system protection (orphan/OOM) → Step 0.5 log rotation + Chrome cleanup → HTTP+RPC health check → config repair → exponential backoff restart |
+| `test-guardian.sh` | 700+ | 47 unit tests + 5 integration tests |
+| `memory_maintenance.py` | 500+ | MEMORY.md compaction + daily memory archival + learnings cleanup |
+| `check_cron_health.py` | 120+ | Critical cron task status check + Chrome CDP self-repair |
+| `post-update.sh` | 80+ | Post-upgrade restart + cron timeout recovery + delivery fix |
+| `upgrade-openclaw.sh` | ~50 | Upgrade entrypoint, auto-invokes post-update |
 
 | 脚本 | 行数 | 作用 |
 |------|------|------|
-| `heartbeat-guardian.sh` | 600+ | **核心**。Step 0 系统保护(孤儿/OOM) → HTTP+RPC 健康检查 → 配置修复 → 指数退避重启 |
+| `heartbeat-guardian.sh` | 800+ | **核心**。Step 0 系统保护(孤儿/OOM) → Step 0.5 日志轮转+Chrome清理 → HTTP+RPC 健康检查 → 配置修复 → 指数退避重启 |
 | `test-guardian.sh` | 700+ | 47 个单元测试 + 5 个集成测试 |
 | `memory_maintenance.py` | 500+ | MEMORY.md 压缩 + daily memory 归档 + learnings 清理 |
 | `check_cron_health.py` | 120+ | 关键 cron 任务状态检查 + Chrome CDP 自修复 |
 | `post-update.sh` | 80+ | 升级后重启 + 恢复 cron timeout + 修复 delivery |
 | `upgrade-openclaw.sh` | ~50 | 升级入口，自动调用 post-update |
-| `switch_model.py` | ~200 | 全层级模型切换（全局→per-agent→cron→session） |
 
-## 处理过的问题
+## Configuration / 配置
 
-1. Agent 改坏配置 → Gateway 起不来 → 无限重启
-2. API 额度耗尽 → 模型配置 4 层优先级不一致
-3. Session 膨胀 → Agent 变笨
-4. Chrome SingletonLock / Renderer 堆积
-5. 运维脚本自己把 Gateway 搞挂（检查太频繁）
-6. **ACP 子进程孤儿累积 → OOM → macOS 系统崩溃**（Bug #35886）
-7. **SOCKS 代理干扰 localhost 健康检查**
-8. **DEGRADED 阈值过严 → 正常业务行为被当成故障**
+Edit the variables at the top of `heartbeat-guardian.sh`:
 
-## 配置
-
-`heartbeat-guardian.sh` 顶部的配置区块：
+编辑 `heartbeat-guardian.sh` 顶部的配置区：
 
 ```bash
-GATEWAY_PORT=18789           # Gateway HTTP 端口
-HEALTH_TIMEOUT=5             # HTTP 健康检查超时(秒)
-RPC_HEALTH_TIMEOUT=8         # RPC 健康检查超时(秒)
-DEGRADED_ERROR_THRESHOLD=15  # err.log 严重错误阈值
-DEGRADED_CONSECUTIVE_THRESHOLD=3  # 连续 DEGRADED 次数
-MAX_TOTAL_RETRIES=6          # 最大重试次数
-CRASH_DECAY_HOURS=6          # 故障计数器自动衰减时间
-BACKOFF_DELAYS=(60 120 300 600 900 1800)  # 指数退避(秒)
-ACTIVE_HOURS_START="08:00"   # 活跃时段(DEGRADED 不重启)
-ACTIVE_HOURS_END="23:00"
+GATEWAY_PORT=18789                         # Gateway HTTP port
+HEALTH_TIMEOUT=5                           # HTTP health check timeout (seconds)
+RPC_HEALTH_TIMEOUT=8                       # RPC health check timeout (seconds)
+DEGRADED_ERROR_THRESHOLD=15                # Severe error threshold in err.log
+DEGRADED_CONSECUTIVE_THRESHOLD=3           # Consecutive DEGRADED count before restart
+MAX_TOTAL_RETRIES=6                        # Maximum retry count
+CRASH_DECAY_HOURS=6                        # Fault counter auto-decay interval
+BACKOFF_DELAYS=(60 120 300 600 900 1800)   # Exponential backoff (seconds)
+ACTIVE_HOURS_START="08:00"                 # Active hours start (DEGRADED won't trigger restart)
+ACTIVE_HOURS_END="23:00"                   # Active hours end
 ```
 
-## 测试
+## What it handles / 能处理的问题
+
+Problems this system has handled in production:
+
+以下是生产环境中实际处理过的问题：
+
+1. **Agent corrupts config** → Gateway boot loop → auto config rollback
+2. **API quota exhausted** → model fallback inconsistency across 4 priority layers
+3. **Session bloat** → agent context degradation
+4. **Chrome `SingletonLock` / Renderer pile-up** → browser automation failure
+5. **Guardian itself destabilizing Gateway** → overly aggressive health checks
+6. **ACP child process orphan accumulation → OOM → macOS system crash** (OpenClaw Bug #35886)
+7. **SOCKS proxy interfering with localhost health checks** → false negative detection
+8. **Overly strict DEGRADED thresholds** → normal operational noise triggering unnecessary restarts
+9. **Chrome orphan processes consuming 10GB+ RAM** → gradual memory exhaustion
+10. **Log files growing unbounded** → disk space exhaustion
+
+## Testing / 测试
 
 ```bash
-# 运行全部 47 个测试
+# Run all 47 tests
 bash tests/test-guardian.sh
 
-# 输出示例:
+# Example output:
 # ✓ crash counter starts at 0
 # ✓ crash counter increments
 # ...
