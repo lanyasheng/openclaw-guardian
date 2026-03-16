@@ -68,6 +68,7 @@ cd openclaw-guardian
 cp scripts/heartbeat-guardian.sh ~/.openclaw/scripts/
 cp scripts/memory_maintenance.py ~/.openclaw/scripts/
 cp scripts/check_cron_health.py ~/.openclaw/scripts/
+cp scripts/cleanup_heartbeat_sessions.sh ~/.openclaw/scripts/
 cp scripts/post-update.sh ~/.openclaw/scripts/
 cp scripts/upgrade-openclaw.sh ~/.openclaw/scripts/
 chmod +x ~/.openclaw/scripts/*.sh
@@ -87,6 +88,9 @@ Add the following entries / 添加以下条目：
 
 # L3 Memory maintenance — every Sunday 4 AM / 每周日凌晨 4 点
 0 4 * * 0 python3 ~/.openclaw/scripts/memory_maintenance.py --all --broadcast
+
+# L3 Heartbeat session cleanup — daily 4 AM / 每天凌晨 4 点
+0 4 * * * /bin/bash ~/.openclaw/scripts/cleanup_heartbeat_sessions.sh >> ~/.openclaw/logs/heartbeat-cleanup.log 2>&1
 
 # L3 Cron health — every 30 minutes / 每 30 分钟
 */30 * * * * python3 ~/.openclaw/scripts/check_cron_health.py
@@ -110,6 +114,7 @@ bash tests/test-guardian.sh
 | `test-guardian.sh` | 700+ | 47 unit tests + 5 integration tests |
 | `memory_maintenance.py` | 500+ | MEMORY.md compaction + daily memory archival + learnings cleanup |
 | `check_cron_health.py` | 120+ | Critical cron task status check + Chrome CDP self-repair |
+| `cleanup_heartbeat_sessions.sh` | ~60 | Heartbeat session bloat prevention — archives sessions exceeding 50KB threshold + rotates session IDs |
 | `post-update.sh` | 80+ | Post-upgrade restart + cron timeout recovery + delivery fix |
 | `upgrade-openclaw.sh` | ~50 | Upgrade entrypoint, auto-invokes post-update |
 
@@ -119,6 +124,7 @@ bash tests/test-guardian.sh
 | `test-guardian.sh` | 700+ | 47 个单元测试 + 5 个集成测试 |
 | `memory_maintenance.py` | 500+ | MEMORY.md 压缩 + daily memory 归档 + learnings 清理 |
 | `check_cron_health.py` | 120+ | 关键 cron 任务状态检查 + Chrome CDP 自修复 |
+| `cleanup_heartbeat_sessions.sh` | ~60 | Heartbeat session 膨胀防护——超过 50KB 阈值的 session 自动归档 + 轮转 session ID |
 | `post-update.sh` | 80+ | 升级后重启 + 恢复 cron timeout + 修复 delivery |
 | `upgrade-openclaw.sh` | ~50 | 升级入口，自动调用 post-update |
 
@@ -157,6 +163,7 @@ Problems this system has handled in production:
 8. **Overly strict DEGRADED thresholds** → normal operational noise triggering unnecessary restarts
 9. **Chrome orphan processes consuming 10GB+ RAM** → gradual memory exhaustion
 10. **Log files growing unbounded** → disk space exhaustion
+11. **Heartbeat session bloat** → `target: "last"` causes unbounded session growth (v2026.3.13 lacks `isolatedSession`) → agent unresponsive due to lane blocking
 
 ## Testing / 测试
 
