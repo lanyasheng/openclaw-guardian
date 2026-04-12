@@ -71,6 +71,7 @@ cp scripts/check_cron_health.py ~/.openclaw/scripts/
 cp scripts/cleanup_heartbeat_sessions.sh ~/.openclaw/scripts/
 cp scripts/post-update.sh ~/.openclaw/scripts/
 cp scripts/upgrade-openclaw.sh ~/.openclaw/scripts/
+cp scripts/claude-process-reaper.sh ~/.openclaw/scripts/
 chmod +x ~/.openclaw/scripts/*.sh
 ```
 
@@ -94,6 +95,10 @@ Add the following entries / 添加以下条目：
 
 # L3 Cron health — every 30 minutes / 每 30 分钟
 */30 * * * * python3 ~/.openclaw/scripts/check_cron_health.py
+
+# L2 Claude Code zombie reaper — every 30 minutes, kills sessions >12h
+# Claude Code 僵尸收割 — 每 30 分钟，清理超过 12h 的泄漏会话
+*/30 * * * * /bin/bash ~/.openclaw/scripts/claude-process-reaper.sh
 ```
 
 ### Verify / 验证
@@ -117,6 +122,7 @@ bash tests/test-guardian.sh
 | `cleanup_heartbeat_sessions.sh` | ~60 | Heartbeat session bloat prevention — archives sessions exceeding 50KB threshold + rotates session IDs |
 | `post-update.sh` | 80+ | Post-upgrade restart + cron timeout recovery + delivery fix |
 | `upgrade-openclaw.sh` | ~50 | Upgrade entrypoint, auto-invokes post-update |
+| `claude-process-reaper.sh` | ~100 | Claude Code zombie reaper — kills leaked CLI sessions older than 12h (configurable), with SIGTERM→SIGKILL escalation and memory monitoring |
 
 | 脚本 | 行数 | 作用 |
 |------|------|------|
@@ -127,6 +133,7 @@ bash tests/test-guardian.sh
 | `cleanup_heartbeat_sessions.sh` | ~60 | Heartbeat session 膨胀防护——超过 50KB 阈值的 session 自动归档 + 轮转 session ID |
 | `post-update.sh` | 80+ | 升级后重启 + 恢复 cron timeout + 修复 delivery |
 | `upgrade-openclaw.sh` | ~50 | 升级入口，自动调用 post-update |
+| `claude-process-reaper.sh` | ~100 | Claude Code 僵尸收割器——清理超过 12h 的泄漏 CLI 会话，SIGTERM→SIGKILL 升级 + 内存监控 |
 
 ## Configuration / 配置
 
