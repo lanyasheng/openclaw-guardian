@@ -16,6 +16,7 @@ LAST_KNOWN_GOOD_DIR="$OPENCLAW_DIR/backups/last-known-good"
 CONFIG_FILE="$OPENCLAW_DIR/openclaw.json"
 CRON_FILE="$OPENCLAW_DIR/cron/jobs.json"
 LOG_FILE="$OPENCLAW_DIR/logs/guardian.log"
+LOG_DIR="$OPENCLAW_DIR/logs"
 ERR_LOG="$OPENCLAW_DIR/logs/gateway.err.log"
 PYTHON=/opt/homebrew/bin/python3.12
 STATE_DIR="$OPENCLAW_DIR/watchdog"
@@ -24,6 +25,7 @@ LAUNCHD_SERVICE="ai.openclaw.gateway"
 GATEWAY_PORT=18789
 HEALTH_TIMEOUT=5
 RPC_HEALTH_TIMEOUT=8
+CLI_HEALTH_TIMEOUT=12
 DEGRADED_LOG_WINDOW_SECONDS=180
 DEGRADED_ERROR_THRESHOLD=15
 DEGRADED_CONSECUTIVE_THRESHOLD=3
@@ -31,6 +33,10 @@ MAX_BACKUPS=24
 MAX_TOTAL_RETRIES=6
 CRASH_DECAY_HOURS=6
 MAX_DOCTOR_FIX=2
+
+# claude 进程数熔断阈值
+MAX_CLAUDE_PROCESSES=${OPENCLAW_MAX_CONCURRENT_SUBAGENTS:-15}
+CLAUDE_PROCESS_WARN_THRESHOLD=$((MAX_CLAUDE_PROCESSES / 2))
 
 # 指数退避延迟（秒）
 BACKOFF_DELAYS=(60 120 300 600 900 1800)
@@ -73,7 +79,7 @@ HEALING_LOCK="/tmp/openclaw-guardian.lock"
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
     if $DRY_RUN; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >&2
     fi
 }
 
@@ -170,18 +176,28 @@ check_crash_decay() {
     local decay_seconds=$((CRASH_DECAY_HOURS * 3600))
     if [[ $elapsed -ge $decay_seconds ]]; then
         log "[INFO] Crash counter auto-reset (${CRASH_DECAY_HOURS}h elapsed)"
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would reset crash counter"
+            return
+        fi
         echo "0" > "$CRASH_COUNTER_FILE"
         rm -f "$CRASH_TIMESTAMP_FILE"
     fi
 }
 
 increment_crash_count() {
+    if $DRY_RUN; then
+        return
+    fi
     local count=$(get_crash_count)
     echo $((count + 1)) > "$CRASH_COUNTER_FILE"
     date +%s > "$CRASH_TIMESTAMP_FILE"
 }
 
 decrement_crash_count() {
+    if $DRY_RUN; then
+        return
+    fi
     local count=$(get_crash_count)
     if [[ $count -gt 0 ]]; then
         echo $((count - 1)) > "$CRASH_COUNTER_FILE"
@@ -189,6 +205,9 @@ decrement_crash_count() {
 }
 
 reset_crash_count() {
+    if $DRY_RUN; then
+        return
+    fi
     echo "0" > "$CRASH_COUNTER_FILE"
     rm -f "$CRASH_TIMESTAMP_FILE"
 }
@@ -224,6 +243,9 @@ is_in_cooldown() {
 }
 
 set_last_restart() {
+    if $DRY_RUN; then
+        return
+    fi
     date +%s > "$COOLDOWN_FILE"
 }
 
@@ -239,6 +261,9 @@ get_unhealthy_streak() {
 }
 
 reset_unhealthy_streak() {
+    if $DRY_RUN; then
+        return
+    fi
     echo "0" > "$UNHEALTHY_STREAK_FILE"
     rm -f "$UNHEALTHY_REASON_FILE"
 }
@@ -247,6 +272,10 @@ increment_unhealthy_streak() {
     local reason="$1"
     local count=$(get_unhealthy_streak)
     count=$((count + 1))
+    if $DRY_RUN; then
+        echo "$count"
+        return
+    fi
     echo "$count" > "$UNHEALTHY_STREAK_FILE"
     echo "$reason" > "$UNHEALTHY_REASON_FILE"
     echo "$count"
@@ -290,8 +319,10 @@ check_rpc_health() {
 # 退化信号检测（日志层）
 # ============================================================================
 check_degraded_signals() {
+    local cli_degraded
     if [[ ! -f "$ERR_LOG" ]]; then
-        echo "NONE"
+        cli_degraded=$(check_cli_degraded_signals)
+        echo "$cli_degraded"
         return
     fi
 
@@ -299,7 +330,8 @@ check_degraded_signals() {
     local mtime=$(stat -f %m "$ERR_LOG" 2>/dev/null || echo "0")
     local age=$((now - mtime))
     if [[ "$age" -gt "$DEGRADED_LOG_WINDOW_SECONDS" ]]; then
-        echo "NONE"
+        cli_degraded=$(check_cli_degraded_signals)
+        echo "$cli_degraded"
         return
     fi
 
@@ -310,8 +342,48 @@ check_degraded_signals() {
     if [[ "$severe" -ge "$DEGRADED_ERROR_THRESHOLD" ]]; then
         echo "DEGRADED:$severe"
     else
-        echo "NONE"
+        cli_degraded=$(check_cli_degraded_signals)
+        echo "$cli_degraded"
     fi
+}
+
+check_cli_degraded_signals() {
+    "$PYTHON" - "$CLI_HEALTH_TIMEOUT" <<'PY' 2>/dev/null
+import re
+import subprocess
+import sys
+
+timeout = int(sys.argv[1])
+try:
+    proc = subprocess.run(
+        ["openclaw", "health"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+except subprocess.TimeoutExpired:
+    print("DEGRADED:cli_health_timeout")
+    raise SystemExit(0)
+
+output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+if proc.returncode != 0:
+    lowered = output.lower()
+    if "gateway timeout" in lowered or "gatewaytransporterror" in lowered:
+        print("DEGRADED:cli_health_timeout")
+    else:
+        print("DEGRADED:cli_health_failed")
+    raise SystemExit(0)
+
+match = re.search(r"Gateway event loop:\s+degraded\s+([^\n]+)", output)
+if not match:
+    print("NONE")
+    raise SystemExit(0)
+
+detail = match.group(1).strip()
+reasons = re.search(r"reasons=([A-Za-z0-9_,.-]+)", detail)
+reason_text = reasons.group(1) if reasons else "unknown"
+print(f"DEGRADED:cli_event_loop:{reason_text}")
+PY
 }
 
 # ============================================================================
@@ -396,21 +468,46 @@ try_doctor_fix() {
         return 1
     fi
 
+    if service_version_drift; then
+        log "[WARN] Refusing doctor --fix until Gateway service version matches CLI"
+        repair_gateway_service_install || return 1
+        if service_version_drift; then
+            log "[ERROR] Gateway service version still mismatched after repair attempt; skipping doctor --fix"
+            return 1
+        fi
+    fi
+
     log "[ACTION] Config error detected — running 'openclaw doctor --fix --non-interactive --yes' (attempt $((fix_count+1))/${MAX_DOCTOR_FIX})"
-    echo $((fix_count + 1)) > "$DOCTOR_FIX_COUNTER_FILE"
 
     if $DRY_RUN; then
         log "[DRY-RUN] Would run: openclaw doctor --fix --non-interactive --yes"
         return 0
     fi
 
+    echo $((fix_count + 1)) > "$DOCTOR_FIX_COUNTER_FILE"
+
+    local before_doctor="$CONFIG_FILE.pre-doctor.$TIMESTAMP"
+    cp "$CONFIG_FILE" "$before_doctor"
+
     local doctor_output
     doctor_output=$(openclaw doctor --fix --non-interactive --yes 2>&1) || true
     log "[INFO] doctor --fix output: ${doctor_output:0:300}"
-    return 0
+
+    if validate_current_config_schema; then
+        log "[OK] doctor --fix result passed schema validation"
+        return 0
+    fi
+
+    cp "$CONFIG_FILE" "$CONFIG_FILE.bad-doctor.$TIMESTAMP"
+    cp "$before_doctor" "$CONFIG_FILE"
+    log "[ERROR] doctor --fix produced unsafe config; restored pre-doctor backup"
+    return 1
 }
 
 reset_doctor_fix_counter() {
+    if $DRY_RUN; then
+        return
+    fi
     rm -f "$DOCTOR_FIX_COUNTER_FILE"
 }
 # ============================================================================
@@ -418,6 +515,10 @@ reset_doctor_fix_counter() {
 # ============================================================================
 wait_for_gateway_startup() {
     local reason="$1"
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would wait for Gateway startup after $reason"
+        return 0
+    fi
     local wait_max=30
     local wait_interval=5
     local waited=0
@@ -436,23 +537,185 @@ wait_for_gateway_startup() {
     return 1
 }
 
+run_post_update() {
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would run post-update.sh"
+        return 0
+    fi
+    bash "$OPENCLAW_DIR/scripts/post-update.sh" >> "$LOG_FILE" 2>&1 || true
+}
+
 
 # ============================================================================
 # Last-Known-Good 配置管理（核心改进 #3）
 # ============================================================================
 save_last_known_good() {
+    if ! config_file_is_safe "$CONFIG_FILE"; then
+        log "[WARN] Refusing to save last-known-good: config is not schema-safe"
+        return 1
+    fi
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would save last-known-good config"
+        return 0
+    fi
     cp "$CONFIG_FILE" "$LAST_KNOWN_GOOD_DIR/openclaw.json"
     log "[BACKUP] Saved last-known-good config"
 }
 
 restore_last_known_good() {
     local lkg_file="$LAST_KNOWN_GOOD_DIR/openclaw.json"
-    if [[ -f "$lkg_file" ]] && $PYTHON -c "import json; json.load(open('$lkg_file'))" 2>/dev/null; then
+    if [[ -f "$lkg_file" ]] && config_file_is_safe "$lkg_file"; then
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would restore last-known-good config"
+            return 0
+        fi
         cp "$CONFIG_FILE" "$CONFIG_FILE.bad.$TIMESTAMP"
         cp "$lkg_file" "$CONFIG_FILE"
         log "[RECOVERED] Restored last-known-good config (bad config saved as .bad.$TIMESTAMP)"
         return 0
     fi
+    return 1
+}
+
+config_file_is_safe() {
+    local file="$1"
+    "$PYTHON" - "$file" <<'PY' 2>/dev/null
+import json
+import os
+import plistlib
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+
+plist_path = os.path.expanduser("~/Library/LaunchAgents/ai.openclaw.gateway.plist")
+legacy_gateway = False
+try:
+    with open(plist_path, "rb") as f:
+        plist = plistlib.load(f)
+    args = " ".join(plist.get("ProgramArguments", []))
+    legacy_gateway = "openclawbugfix/openclaw" in args or "2026.4" in plist.get("Comment", "")
+except Exception:
+    legacy_gateway = False
+
+problems = []
+thread_bindings = (
+    data.get("channels", {})
+    .get("discord", {})
+    .get("threadBindings", {})
+)
+if "spawnSessions" in thread_bindings:
+    problems.append("channels.discord.threadBindings.spawnSessions")
+
+qmd_update = (
+    data.get("memory", {})
+    .get("qmd", {})
+    .get("update", {})
+)
+for key in ("startup", "startupDelayMs"):
+    if key in qmd_update:
+        problems.append(f"memory.qmd.update.{key}")
+
+if legacy_gateway and problems:
+    print(", ".join(problems))
+    sys.exit(1)
+PY
+}
+
+validate_current_config_schema() {
+    config_file_is_safe "$CONFIG_FILE" && openclaw config validate >/tmp/openclaw-config-validate.out 2>&1
+}
+
+get_cli_version() {
+    openclaw --version 2>/dev/null | awk '{print $2}' | head -1
+}
+
+get_service_index_path() {
+    "$PYTHON" - <<'PY' 2>/dev/null
+import os
+import plistlib
+
+plist_path = os.path.expanduser("~/Library/LaunchAgents/ai.openclaw.gateway.plist")
+with open(plist_path, "rb") as f:
+    plist = plistlib.load(f)
+for arg in plist.get("ProgramArguments", []):
+    if arg.endswith("/dist/index.js") or arg.endswith("/openclaw/dist/index.js"):
+        print(arg)
+        break
+PY
+}
+
+get_package_version_for_index() {
+    local index_path="$1"
+    "$PYTHON" - "$index_path" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1]).resolve()
+for parent in [path.parent, *path.parents]:
+    package = parent / "package.json"
+    if package.exists():
+        with package.open(encoding="utf-8") as f:
+            print(json.load(f).get("version", ""))
+        break
+PY
+}
+
+get_service_version() {
+    local index_path
+    index_path=$(get_service_index_path)
+    if [[ -z "$index_path" ]]; then
+        echo ""
+        return
+    fi
+    get_package_version_for_index "$index_path"
+}
+
+service_version_drift() {
+    local cli_version service_version service_index
+    cli_version=$(get_cli_version)
+    service_version=$(get_service_version)
+    service_index=$(get_service_index_path)
+
+    if [[ -z "$cli_version" ]] || [[ -z "$service_version" ]]; then
+        log "[WARN] Unable to compare OpenClaw CLI/Gateway versions (cli=${cli_version:-unknown}, service=${service_version:-unknown})"
+        return 1
+    fi
+
+    if [[ "$cli_version" != "$service_version" ]]; then
+        log "[ERROR] OpenClaw CLI/Gateway version drift: cli=$cli_version service=$service_version index=${service_index:-unknown}"
+        return 0
+    fi
+    return 1
+}
+
+repair_gateway_service_install() {
+    log "[ACTION] Reinstalling Gateway LaunchAgent from current OpenClaw CLI"
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would run: openclaw gateway install --force --port $GATEWAY_PORT"
+        return 0
+    fi
+
+    local output
+    output=$(openclaw gateway install --force --port "$GATEWAY_PORT" 2>&1) || {
+        log "[WARN] gateway install --force failed: ${output:0:500}"
+        return 1
+    }
+    log "[INFO] gateway install --force output: ${output:0:500}"
+    return 0
+}
+
+find_safe_config_backup() {
+    local candidate
+    for candidate in $(ls -1t "$BACKUP_DIR"/openclaw.json.* 2>/dev/null); do
+        if config_file_is_safe "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+        log "[WARN] Skipping unsafe config backup: $candidate"
+    done
     return 1
 }
 
@@ -554,16 +817,22 @@ RECOVERED=0
         done
         ORPHAN_N=0
         for opid in $ORPHAN_PIDS; do
-            kill -TERM "$opid" 2>/dev/null
+            if ! $DRY_RUN; then
+                kill -TERM "$opid" 2>/dev/null
+            fi
             ORPHAN_N=$((ORPHAN_N + 1))
         done
         if [[ "$ORPHAN_N" -gt 0 ]]; then
-            sleep 2
-            for opid in $(ps -eo pid,ppid,comm 2>/dev/null | awk '$3=="openclaw" && $2==1 {print $1}'); do
-                [[ -n "$GW_PARENT" ]] && [[ "$opid" == "$GW_PARENT" ]] && continue
-                kill -9 "$opid" 2>/dev/null
-            done
-            log "[ORPHAN-GC] Killed $ORPHAN_N orphan openclaw processes (PPID=1)"
+            if $DRY_RUN; then
+                log "[DRY-RUN] Would kill $ORPHAN_N orphan openclaw processes (PPID=1)"
+            else
+                sleep 2
+                for opid in $(ps -eo pid,ppid,comm 2>/dev/null | awk '$3=="openclaw" && $2==1 {print $1}'); do
+                    [[ -n "$GW_PARENT" ]] && [[ "$opid" == "$GW_PARENT" ]] && continue
+                    kill -9 "$opid" 2>/dev/null
+                done
+                log "[ORPHAN-GC] Killed $ORPHAN_N orphan openclaw processes (PPID=1)"
+            fi
         fi
     fi
 
@@ -577,10 +846,14 @@ RECOVERED=0
             if [[ "$SWAP_PCT" -gt 80 ]]; then
                 log "[EMERGENCY] Swap ${SWAP_PCT}% (${SWAP_USED}M/${SWAP_TOTAL}M) — force-killing orphans"
                 GW_PARENT_E=$(ps -o ppid= -p "$(pgrep -f openclaw-gateway | head -1)" 2>/dev/null | tr -d ' ')
-                for opid in $(ps -eo pid,ppid,comm 2>/dev/null | awk '$3=="openclaw" && $2==1 {print $1}'); do
-                    [[ -n "$GW_PARENT_E" ]] && [[ "$opid" == "$GW_PARENT_E" ]] && continue
-                    kill -9 "$opid" 2>/dev/null
-                done
+                if $DRY_RUN; then
+                    log "[DRY-RUN] Would force-kill orphan openclaw processes due to high swap"
+                else
+                    for opid in $(ps -eo pid,ppid,comm 2>/dev/null | awk '$3=="openclaw" && $2==1 {print $1}'); do
+                        [[ -n "$GW_PARENT_E" ]] && [[ "$opid" == "$GW_PARENT_E" ]] && continue
+                        kill -9 "$opid" 2>/dev/null
+                    done
+                fi
                 PROC_REMAIN=$(ps -eo comm 2>/dev/null | grep -c "^openclaw$")
                 log "[EMERGENCY] Post-cleanup: $PROC_REMAIN openclaw processes remain"
             fi
@@ -592,10 +865,14 @@ RECOVERED=0
     if [[ "$PROC_COUNT" -gt 30 ]]; then
         log "[MEMORY-WARN] openclaw process count: $PROC_COUNT (>30 threshold)"
         GW_PARENT_P=$(ps -o ppid= -p "$(pgrep -f openclaw-gateway | head -1)" 2>/dev/null | tr -d ' ')
-        for opid in $(ps -eo pid,ppid,comm 2>/dev/null | awk '$3=="openclaw" && $2==1 {print $1}'); do
-            [[ -n "$GW_PARENT_P" ]] && [[ "$opid" == "$GW_PARENT_P" ]] && continue
-            kill -9 "$opid" 2>/dev/null
-        done
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would clean orphan openclaw processes because process count is high"
+        else
+            for opid in $(ps -eo pid,ppid,comm 2>/dev/null | awk '$3=="openclaw" && $2==1 {print $1}'); do
+                [[ -n "$GW_PARENT_P" ]] && [[ "$opid" == "$GW_PARENT_P" ]] && continue
+                kill -9 "$opid" 2>/dev/null
+            done
+        fi
         PROC_AFTER=$(ps -eo comm 2>/dev/null | grep -c "^openclaw$")
         log "[ORPHAN-GC] Emergency cleanup: $PROC_COUNT -> $PROC_AFTER openclaw processes"
     fi
@@ -609,16 +886,28 @@ for logf in "$LOG_DIR/gateway.err.log" "$LOG_DIR/gateway.log" "$LOG_DIR/browser-
     if [[ -f "$logf" ]]; then
         sz=$(stat -f%z "$logf" 2>/dev/null || echo 0)
         if (( sz > 10485760 )); then
-            mv "$logf" "${logf}.1"
-            : > "$logf"
-            log "[LOG-ROTATE] Rotated $(basename "$logf") (was $(( sz / 1048576 ))MB)"
+            if $DRY_RUN; then
+                log "[DRY-RUN] Would rotate $(basename "$logf") (currently $(( sz / 1048576 ))MB)"
+            else
+                mv "$logf" "${logf}.1"
+                : > "$logf"
+                log "[LOG-ROTATE] Rotated $(basename "$logf") (was $(( sz / 1048576 ))MB)"
+            fi
         fi
     fi
 done
 # Clean rotated logs older than 7 days
-find "$LOG_DIR" -name '*.log.1' -mtime +7 -delete 2>/dev/null
+if $DRY_RUN; then
+    old_rotated=$(find "$LOG_DIR" -name '*.log.1' -mtime +7 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$old_rotated" -gt 0 ]]; then
+        log "[DRY-RUN] Would remove $old_rotated old rotated log files"
+    fi
+else
+    find "$LOG_DIR" -name '*.log.1' -mtime +7 -delete 2>/dev/null
+fi
 
 # Chrome orphan cleanup: kill PPID=1 Chrome instances not used by Gateway
+GW_PID=$(get_port_owner_pid)
 if [[ -n "$GW_PID" ]]; then
     GW_CHROME_PID=$(ps -eo pid,ppid,comm 2>/dev/null | awk -v gw="$GW_PID" '$2==gw && $3~/Google/ {print $1; exit}')
     for chrome_pid in $(ps -eo pid,ppid,comm 2>/dev/null | awk '$3~/Google Chrome/ && $2==1 {print $1}'); do
@@ -627,9 +916,13 @@ if [[ -n "$GW_PID" ]]; then
         fi
         child_count=$(ps -eo ppid 2>/dev/null | awk -v p="$chrome_pid" '$1==p' | wc -l | tr -d ' ')
         if (( child_count > 10 )); then
-            ps -eo pid,ppid 2>/dev/null | awk -v p="$chrome_pid" '$2==p {print $1}' | while read cpid; do kill -9 "$cpid" 2>/dev/null; done
-            kill -9 "$chrome_pid" 2>/dev/null
-            log "[CHROME-GC] Killed orphan Chrome PID=$chrome_pid (had $child_count children)"
+            if $DRY_RUN; then
+                log "[DRY-RUN] Would kill orphan Chrome PID=$chrome_pid (had $child_count children)"
+            else
+                ps -eo pid,ppid 2>/dev/null | awk -v p="$chrome_pid" '$2==p {print $1}' | while read cpid; do kill -9 "$cpid" 2>/dev/null; done
+                kill -9 "$chrome_pid" 2>/dev/null
+                log "[CHROME-GC] Killed orphan Chrome PID=$chrome_pid (had $child_count children)"
+            fi
         fi
     done
 fi
@@ -646,11 +939,22 @@ log "[INFO] HTTP health: $http_status"
 log "[INFO] RPC health: $rpc_status"
 log "[INFO] Degraded signals: $degraded_status"
 
+SERVICE_VERSION_DRIFT=false
+if service_version_drift; then
+    SERVICE_VERSION_DRIFT=true
+fi
+
+if [[ "$pid_status" == "NOT_LOADED" ]] && [[ "$http_status" == "OK" ]] && [[ "$rpc_status" == "OK" ]]; then
+    log "[WARN] Gateway is reachable but LaunchAgent is not loaded; current uptime depends on a manual/unmanaged process"
+fi
+
 # ─── Step 3: 综合判断 Gateway 状态 ───
 GATEWAY_HEALTHY=false
 unhealthy_reason=""
 
-if [[ "$http_status" != "OK" ]]; then
+if $SERVICE_VERSION_DRIFT && ([[ "$http_status" != "OK" ]] || [[ "$rpc_status" != "OK" ]] || is_config_error); then
+    unhealthy_reason="SERVICE_VERSION_DRIFT"
+elif [[ "$http_status" != "OK" ]]; then
     unhealthy_reason="HTTP_$http_status"
 elif [[ "$rpc_status" != "OK" ]]; then
     unhealthy_reason="RPC_$rpc_status"
@@ -683,12 +987,16 @@ else
                 log "[SKIP-RESTART] DEGRADED detected in active hours ($ACTIVE_HOURS_START-$ACTIVE_HOURS_END $ACTIVE_HOURS_TZ), restart suppressed (reason=$unhealthy_reason, streak=$streak)"
             else
                 if [[ $crash_count -ge $MAX_TOTAL_RETRIES ]]; then
-                log "[WARN] Crash count high ($crash_count/$MAX_TOTAL_RETRIES), still applying backoff"
-            fi
+                    log "[WARN] Crash count high ($crash_count/$MAX_TOTAL_RETRIES), still applying backoff"
+                fi
 
             # 检查是否是 config 错误导致的启动失败
             if [[ "$pid_status" == STOPPED:exit_1 ]] || is_config_error; then
                 log "[WARN] Config error pattern detected"
+
+                if $SERVICE_VERSION_DRIFT; then
+                    repair_gateway_service_install || true
+                fi
 
                 # 策略 1: 先尝试 openclaw doctor --fix
                 if try_doctor_fix; then
@@ -707,11 +1015,15 @@ else
                     else
                         # 降级：从定时备份恢复
                         log "[WARN] No last-known-good, trying auto backup"
-                        LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/openclaw.json.* 2>/dev/null | head -1)
-                        if [[ -n "$LATEST_BACKUP" ]] && $PYTHON -c "import json; json.load(open('$LATEST_BACKUP'))" 2>/dev/null; then
-                            cp "$CONFIG_FILE" "$CONFIG_FILE.bad.$TIMESTAMP"
-                            cp "$LATEST_BACKUP" "$CONFIG_FILE"
-                            log "[RECOVERED] Restored from auto backup: $LATEST_BACKUP"
+                        LATEST_BACKUP=$(find_safe_config_backup || true)
+                        if [[ -n "$LATEST_BACKUP" ]]; then
+                            if $DRY_RUN; then
+                                log "[DRY-RUN] Would restore from auto backup: $LATEST_BACKUP"
+                            else
+                                cp "$CONFIG_FILE" "$CONFIG_FILE.bad.$TIMESTAMP"
+                                cp "$LATEST_BACKUP" "$CONFIG_FILE"
+                                log "[RECOVERED] Restored from auto backup: $LATEST_BACKUP"
+                            fi
                             RECOVERED=$((RECOVERED + 1))
                         else
                             log "[CRITICAL] No valid backup found!"
@@ -736,28 +1048,32 @@ else
             request_restart "Unhealthy (PID=$pid_status, reason=$unhealthy_reason)"
 
             # 循环等待启动（最多30s，每5s检查一次）
-            wait_max=30
-            wait_interval=5
-            waited=0
-            post_restart_http=""
-            post_restart_rpc=""
-            while [[ $waited -lt $wait_max ]]; do
-                sleep $wait_interval
-                waited=$(($waited + $wait_interval))
-                post_restart_http=$(check_http_health)
-                post_restart_rpc=$(check_rpc_health)
-                if [[ "$post_restart_http" == "OK" ]] && [[ "$post_restart_rpc" == "OK" ]]; then
-                    log "[RECOVERED] Gateway recovered after restart (waited ${waited}s)"
-                    GATEWAY_HEALTHY=true
-                    RECOVERED=$(($RECOVERED + 1))
-                    reset_doctor_fix_counter
-                    reset_unhealthy_streak
-                    break
+            if $DRY_RUN; then
+                log "[DRY-RUN] Would wait for Gateway startup after restart"
+            else
+                wait_max=30
+                wait_interval=5
+                waited=0
+                post_restart_http=""
+                post_restart_rpc=""
+                while [[ $waited -lt $wait_max ]]; do
+                    sleep $wait_interval
+                    waited=$(($waited + $wait_interval))
+                    post_restart_http=$(check_http_health)
+                    post_restart_rpc=$(check_rpc_health)
+                    if [[ "$post_restart_http" == "OK" ]] && [[ "$post_restart_rpc" == "OK" ]]; then
+                        log "[RECOVERED] Gateway recovered after restart (waited ${waited}s)"
+                        GATEWAY_HEALTHY=true
+                        RECOVERED=$(($RECOVERED + 1))
+                        reset_doctor_fix_counter
+                        reset_unhealthy_streak
+                        break
+                    fi
+                    log "[INFO] Waiting for Gateway startup... ${waited}s/${wait_max}s (HTTP=$post_restart_http, RPC=$post_restart_rpc)"
+                done
+                if [[ "$post_restart_http" != "OK" ]] || [[ "$post_restart_rpc" != "OK" ]]; then
+                    log "[WARN] Gateway still unhealthy after ${wait_max}s (HTTP=$post_restart_http, RPC=$post_restart_rpc)"
                 fi
-                log "[INFO] Waiting for Gateway startup... ${waited}s/${wait_max}s (HTTP=$post_restart_http, RPC=$post_restart_rpc)"
-            done
-            if [[ "$post_restart_http" != "OK" ]] || [[ "$post_restart_rpc" != "OK" ]]; then
-                log "[WARN] Gateway still unhealthy after ${wait_max}s (HTTP=$post_restart_http, RPC=$post_restart_rpc)"
             fi
             fi  # Close should_restart_for_degraded
         fi
@@ -768,7 +1084,40 @@ fi
 CONFIG_VALID=0
 if $PYTHON -c "import json; json.load(open('$CONFIG_FILE'))" 2>/dev/null; then
     log "[OK] openclaw.json is valid JSON"
-    CONFIG_VALID=1
+    if validate_current_config_schema; then
+        log "[OK] openclaw.json passed schema validation"
+        CONFIG_VALID=1
+    else
+        log "[ERROR] openclaw.json failed schema/compatibility validation"
+        CONFIG_VALID=0
+        ERRORS=$((ERRORS + 1))
+        log "[RECOVER] Attempting to restore schema-safe openclaw.json from backup..."
+        if restore_last_known_good; then
+            RECOVERED=$((RECOVERED + 1))
+            request_restart "Config restored from schema-safe last-known-good"
+            wait_for_gateway_startup "schema-safe last-known-good restore"
+            run_post_update
+            CONFIG_VALID=1
+        else
+            LATEST_BACKUP=$(find_safe_config_backup || true)
+            if [[ -n "$LATEST_BACKUP" ]]; then
+                if $DRY_RUN; then
+                    log "[DRY-RUN] Would restore schema-safe auto backup: $LATEST_BACKUP"
+                else
+                    cp "$CONFIG_FILE" "$CONFIG_FILE.bad-schema.$TIMESTAMP"
+                    cp "$LATEST_BACKUP" "$CONFIG_FILE"
+                    log "[RECOVERED] Restored schema-safe auto backup: $LATEST_BACKUP"
+                fi
+                RECOVERED=$((RECOVERED + 1))
+                request_restart "Config restored from schema-safe auto backup"
+                wait_for_gateway_startup "schema-safe auto backup restore"
+                run_post_update
+                CONFIG_VALID=1
+            else
+                log "[CRITICAL] No schema-safe backup found for openclaw.json"
+            fi
+        fi
+    fi
 else
     log "[ERROR] openclaw.json is INVALID JSON!"
     CONFIG_VALID=0
@@ -780,18 +1129,22 @@ else
         RECOVERED=$((RECOVERED + 1))
         request_restart "Config restored from last-known-good"
         wait_for_gateway_startup "last-known-good restore"
-        bash "$OPENCLAW_DIR/scripts/post-update.sh" >> "$LOG_FILE" 2>&1 || true
+        run_post_update
         CONFIG_VALID=1
     else
-        LATEST_BACKUP=$(ls -t "$BACKUP_DIR"/openclaw.json.* 2>/dev/null | head -1)
-        if [[ -n "$LATEST_BACKUP" ]] && $PYTHON -c "import json; json.load(open('$LATEST_BACKUP'))" 2>/dev/null; then
-            cp "$CONFIG_FILE" "$CONFIG_FILE.corrupted.$TIMESTAMP"
-            cp "$LATEST_BACKUP" "$CONFIG_FILE"
-            log "[RECOVERED] Restored from $LATEST_BACKUP"
+        LATEST_BACKUP=$(find_safe_config_backup || true)
+        if [[ -n "$LATEST_BACKUP" ]]; then
+            if $DRY_RUN; then
+                log "[DRY-RUN] Would restore from $LATEST_BACKUP"
+            else
+                cp "$CONFIG_FILE" "$CONFIG_FILE.corrupted.$TIMESTAMP"
+                cp "$LATEST_BACKUP" "$CONFIG_FILE"
+                log "[RECOVERED] Restored from $LATEST_BACKUP"
+            fi
             RECOVERED=$((RECOVERED + 1))
             request_restart "Config restored from auto backup"
             wait_for_gateway_startup "auto backup restore"
-            bash "$OPENCLAW_DIR/scripts/post-update.sh" >> "$LOG_FILE" 2>&1 || true
+            run_post_update
             CONFIG_VALID=1
         else
             log "[CRITICAL] No valid backup found for openclaw.json"
@@ -810,9 +1163,13 @@ else
     ERRORS=$((ERRORS + 1))
     LATEST_CRON_BACKUP=$(ls -t "$BACKUP_DIR"/jobs.json.* 2>/dev/null | head -1)
     if [[ -n "$LATEST_CRON_BACKUP" ]] && $PYTHON -c "import json; json.load(open('$LATEST_CRON_BACKUP'))" 2>/dev/null; then
-        cp "$CRON_FILE" "$CRON_FILE.corrupted.$TIMESTAMP"
-        cp "$LATEST_CRON_BACKUP" "$CRON_FILE"
-        log "[RECOVERED] Restored cron/jobs.json from $LATEST_CRON_BACKUP"
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would restore cron/jobs.json from $LATEST_CRON_BACKUP"
+        else
+            cp "$CRON_FILE" "$CRON_FILE.corrupted.$TIMESTAMP"
+            cp "$LATEST_CRON_BACKUP" "$CRON_FILE"
+            log "[RECOVERED] Restored cron/jobs.json from $LATEST_CRON_BACKUP"
+        fi
         RECOVERED=$((RECOVERED + 1))
     else
         log "[CRITICAL] No valid backup found for cron/jobs.json"
@@ -843,8 +1200,12 @@ fi
 
 # ─── Step 7: 配置备份 ───
 if [[ $CONFIG_VALID -eq 1 ]]; then
-    cp "$CONFIG_FILE" "$BACKUP_DIR/openclaw.json.$TIMESTAMP"
-    log "[BACKUP] openclaw.json backed up"
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would back up openclaw.json"
+    else
+        cp "$CONFIG_FILE" "$BACKUP_DIR/openclaw.json.$TIMESTAMP"
+        log "[BACKUP] openclaw.json backed up"
+    fi
 
     # 如果 Gateway 健康，同时保存为 last-known-good
     if $GATEWAY_HEALTHY; then
@@ -853,8 +1214,12 @@ if [[ $CONFIG_VALID -eq 1 ]]; then
 fi
 
 if [[ $CRON_VALID -eq 1 ]]; then
-    cp "$CRON_FILE" "$BACKUP_DIR/jobs.json.$TIMESTAMP"
-    log "[BACKUP] cron/jobs.json backed up"
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would back up cron/jobs.json"
+    else
+        cp "$CRON_FILE" "$BACKUP_DIR/jobs.json.$TIMESTAMP"
+        log "[BACKUP] cron/jobs.json backed up"
+    fi
 fi
 
 # ─── Step 8: 清理过期备份 ───
@@ -862,8 +1227,12 @@ for PREFIX in openclaw.json jobs.json; do
     BACKUP_COUNT=$(ls -1 "$BACKUP_DIR"/${PREFIX}.* 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$BACKUP_COUNT" -gt "$MAX_BACKUPS" ]]; then
         EXCESS=$((BACKUP_COUNT - MAX_BACKUPS))
-        ls -1t "$BACKUP_DIR"/${PREFIX}.* | tail -$EXCESS | xargs rm -f
-        log "[CLEANUP] Removed $EXCESS old $PREFIX backups"
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would remove $EXCESS old $PREFIX backups"
+        else
+            ls -1t "$BACKUP_DIR"/${PREFIX}.* | tail -$EXCESS | xargs rm -f
+            log "[CLEANUP] Removed $EXCESS old $PREFIX backups"
+        fi
     fi
 done
 
@@ -895,12 +1264,16 @@ if $should_run_session_gc; then
     gc_total=$((gc_deleted + gc_purged + gc_reset + gc_bak + gc_tmp))
 
     if [[ $gc_total -gt 0 ]]; then
-        find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.deleted.*" -delete 2>/dev/null
-        find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.purged" -delete 2>/dev/null
-        find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.reset.*" -delete 2>/dev/null
-        find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.bak*" -type f -delete 2>/dev/null
-        find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.tmp" -type f -delete 2>/dev/null
-        log "[SESSION-GC] Cleaned $gc_total dead session files (deleted=$gc_deleted purged=$gc_purged reset=$gc_reset bak=$gc_bak tmp=$gc_tmp)"
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would clean $gc_total dead session files (deleted=$gc_deleted purged=$gc_purged reset=$gc_reset bak=$gc_bak tmp=$gc_tmp)"
+        else
+            find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.deleted.*" -delete 2>/dev/null
+            find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.purged" -delete 2>/dev/null
+            find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.reset.*" -delete 2>/dev/null
+            find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.bak*" -type f -delete 2>/dev/null
+            find "$OPENCLAW_DIR/agents"/*/sessions/ -name "*.tmp" -type f -delete 2>/dev/null
+            log "[SESSION-GC] Cleaned $gc_total dead session files (deleted=$gc_deleted purged=$gc_purged reset=$gc_reset bak=$gc_bak tmp=$gc_tmp)"
+        fi
     else
         log "[SESSION-GC] No dead session files found"
     fi
@@ -936,8 +1309,12 @@ if $should_run_session_gc; then
                     GW_TS=$(date -j -f "%a %b %d %T %Y" "$GW_START" +%s 2>/dev/null || echo 0)
                     DIFF=$(( GW_TS - PROC_TS ))
                     if [[ "$DIFF" -gt 300 ]]; then
-                        log "[ORPHAN-GC] Killing orphan openclaw PID $pid (started ${DIFF}s before gateway)"
-                        kill -9 "$pid" 2>/dev/null
+                        if $DRY_RUN; then
+                            log "[DRY-RUN] Would kill orphan openclaw PID $pid (started ${DIFF}s before gateway)"
+                        else
+                            log "[ORPHAN-GC] Killing orphan openclaw PID $pid (started ${DIFF}s before gateway)"
+                            kill -9 "$pid" 2>/dev/null
+                        fi
                         ORPHAN_COUNT=$((ORPHAN_COUNT + 1))
                     fi
                 fi
@@ -961,9 +1338,13 @@ if $should_run_session_gc; then
     if [[ -d "$ACPX_SESSIONS" ]]; then
         acpx_count=$(find "$ACPX_SESSIONS" -name "*.json" -not -name "index.json" -type f -mmin +60 2>/dev/null | wc -l | tr -d ' ')
         if [[ "$acpx_count" -gt 0 ]]; then
-            find "$ACPX_SESSIONS" -name "*.json" -not -name "index.json" -type f -mmin +60 -delete 2>/dev/null
-            find "$ACPX_SESSIONS" -name "*.ndjson" -type f -mmin +60 -delete 2>/dev/null
-            log "[SESSION-GC] Cleaned $acpx_count stale acpx session files (>1h old)"
+            if $DRY_RUN; then
+                log "[DRY-RUN] Would clean $acpx_count stale acpx session files (>1h old)"
+            else
+                find "$ACPX_SESSIONS" -name "*.json" -not -name "index.json" -type f -mmin +60 -delete 2>/dev/null
+                find "$ACPX_SESSIONS" -name "*.ndjson" -type f -mmin +60 -delete 2>/dev/null
+                log "[SESSION-GC] Cleaned $acpx_count stale acpx session files (>1h old)"
+            fi
         fi
     fi
 
@@ -980,7 +1361,11 @@ else:
     print(0)
 " 2>/dev/null)
             if [[ "$acp_count" -gt 0 ]]; then
-                python3 -c "
+                if $DRY_RUN; then
+                    agent_name=$(basename "$(dirname "$(dirname "$sj")")")
+                    log "[DRY-RUN] Would remove $acp_count zombie ACP entries from $agent_name/sessions.json"
+                else
+                    python3 -c "
 import json
 with open('$sj') as f:
     d = json.load(f)
@@ -991,6 +1376,7 @@ if isinstance(d, dict):
 " 2>/dev/null
                 agent_name=$(basename "$(dirname "$(dirname "$sj")")")
                 log "[SESSION-GC] Removed $acp_count zombie ACP entries from $agent_name/sessions.json"
+                fi
             fi
         fi
     done
@@ -1001,17 +1387,66 @@ if isinstance(d, dict):
         log "[SESSION-GC] WARNING: $disk_warn_count disk budget warnings in gateway.err.log — consider session purge"
     fi
 
-    mkdir -p "$STATE_DIR"
-    date +%s > "$SESSION_GC_MARKER"
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would update session GC marker"
+    else
+        mkdir -p "$STATE_DIR"
+        date +%s > "$SESSION_GC_MARKER"
+    fi
+fi
+
+# ─── Step 8.5: Claude 进程数监控 + 自动清理（防 fork 炸弹） ───
+CLAUDE_COUNT=$(pgrep -cf "claude" 2>/dev/null || echo 0)
+RUNNER_COUNT=$(pgrep -cf "subagent_claude_runner" 2>/dev/null || echo 0)
+
+if [[ "$CLAUDE_COUNT" -gt "$MAX_CLAUDE_PROCESSES" ]]; then
+    log "[FORK-BOMB] CRITICAL: claude process count ($CLAUDE_COUNT) exceeds limit ($MAX_CLAUDE_PROCESSES)!"
+    log "[FORK-BOMB] subagent_claude_runner count: $RUNNER_COUNT"
+    log "[FORK-BOMB] Initiating emergency cleanup..."
+
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would clean up subagent runner processes"
+    else
+        pkill -f "subagent_claude_runner" 2>/dev/null || true
+        pkill -f "run_subagent_claude" 2>/dev/null || true
+        sleep 2
+    fi
+
+    AFTER_COUNT=$(pgrep -cf "claude" 2>/dev/null || echo 0)
+    if [[ "$AFTER_COUNT" -gt "$MAX_CLAUDE_PROCESSES" ]]; then
+        log "[FORK-BOMB] Still $AFTER_COUNT claude processes after runner cleanup. Killing orphan claude processes..."
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would kill orphan claude print processes and pytest orchestrators"
+        else
+            pgrep -f "claude.*--permission-mode bypassPermissions --print" 2>/dev/null | while read pid; do
+                PROC_AGE=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')
+                kill "$pid" 2>/dev/null
+            done
+
+            pkill -f "pytest.*orchestrator" 2>/dev/null || true
+        fi
+    fi
+
+    FINAL_COUNT=$(pgrep -cf "claude" 2>/dev/null || echo 0)
+    log "[FORK-BOMB] Cleanup complete. claude processes: $CLAUDE_COUNT → $FINAL_COUNT"
+    ERRORS=$((ERRORS + 1))
+elif [[ "$CLAUDE_COUNT" -gt "$CLAUDE_PROCESS_WARN_THRESHOLD" ]]; then
+    log "[WARN] claude process count elevated: $CLAUDE_COUNT (warn=$CLAUDE_PROCESS_WARN_THRESHOLD, limit=$MAX_CLAUDE_PROCESSES)"
+else
+    log "[OK] claude process count: $CLAUDE_COUNT (limit=$MAX_CLAUDE_PROCESSES)"
 fi
 
 # ─── Step 9: 日志轮转 ───
 if [[ -f "$LOG_FILE" ]]; then
     LINE_COUNT=$(wc -l < "$LOG_FILE" | tr -d ' ')
     if [[ "$LINE_COUNT" -gt 2000 ]]; then
-        tail -1000 "$LOG_FILE" > "$LOG_FILE.tmp"
-        mv "$LOG_FILE.tmp" "$LOG_FILE"
-        log "[CLEANUP] Log rotated (was $LINE_COUNT lines)"
+        if $DRY_RUN; then
+            log "[DRY-RUN] Would rotate guardian.log (was $LINE_COUNT lines)"
+        else
+            tail -1000 "$LOG_FILE" > "$LOG_FILE.tmp"
+            mv "$LOG_FILE.tmp" "$LOG_FILE"
+            log "[CLEANUP] Log rotated (was $LINE_COUNT lines)"
+        fi
     fi
 fi
 
