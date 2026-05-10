@@ -382,6 +382,18 @@ if not match:
 detail = match.group(1).strip()
 reasons = re.search(r"reasons=([A-Za-z0-9_,.-]+)", detail)
 reason_text = reasons.group(1) if reasons else "unknown"
+reason_set = {item for item in reason_text.split(",") if item}
+delay_max = re.search(r"max=(\d+)ms", detail)
+delay_p99 = re.search(r"p99=(\d+)ms", detail)
+max_ms = int(delay_max.group(1)) if delay_max else 0
+p99_ms = int(delay_p99.group(1)) if delay_p99 else 0
+
+# OpenClaw 2026.5.x can report pure CPU/util sampling spikes as degraded even
+# when event-loop delay is 0ms. Treat those as load, not a broken gateway.
+if reason_set and reason_set <= {"event_loop_utilization", "cpu"} and max_ms == 0 and p99_ms == 0:
+    print("NONE")
+    raise SystemExit(0)
+
 print(f"DEGRADED:cli_event_loop:{reason_text}")
 PY
 }
@@ -543,6 +555,234 @@ run_post_update() {
         return 0
     fi
     bash "$OPENCLAW_DIR/scripts/post-update.sh" >> "$LOG_FILE" 2>&1 || true
+}
+
+repair_global_proxy_alignment() {
+    local desired status
+    desired=$("$PYTHON" - "$CONFIG_FILE" <<'PY' 2>/dev/null
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+
+discord = data.get("channels", {}).get("discord", {})
+desired = discord.get("proxy")
+if not desired:
+    for account in (discord.get("accounts") or {}).values():
+        if isinstance(account, dict) and account.get("proxy"):
+            desired = account["proxy"]
+            break
+
+if not desired:
+    print("NONE")
+    sys.exit(3)
+
+global_proxy = data.get("proxy") if isinstance(data.get("proxy"), dict) else {}
+if global_proxy.get("enabled") is True and global_proxy.get("proxyUrl") == desired:
+    print(desired)
+    sys.exit(0)
+
+print(desired)
+sys.exit(2)
+PY
+)
+    status=$?
+
+    if [[ $status -eq 0 ]]; then
+        log "[OK] Global proxy aligned with Discord proxy ($desired)"
+        return 0
+    fi
+    if [[ $status -eq 3 ]]; then
+        log "[INFO] No Discord proxy configured; global proxy alignment skipped"
+        return 0
+    fi
+    if [[ $status -ne 2 ]] || [[ -z "$desired" ]]; then
+        log "[ERROR] Unable to inspect global/Discord proxy alignment"
+        return 1
+    fi
+
+    log "[WARN] Global proxy is missing or differs from Discord proxy; desired=$desired"
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would patch OpenClaw global proxy and restart Gateway"
+        return 0
+    fi
+
+    cp "$CONFIG_FILE" "$BACKUP_DIR/openclaw.json.pre-proxy-repair.$TIMESTAMP"
+
+    local patch_json patch_output
+    patch_json=$("$PYTHON" - "$desired" <<'PY'
+import json
+import sys
+
+print(json.dumps({"proxy": {"enabled": True, "proxyUrl": sys.argv[1]}}))
+PY
+)
+    if ! patch_output=$(printf "%s" "$patch_json" | openclaw config patch --stdin 2>&1); then
+        log "[ERROR] Failed to patch global proxy: ${patch_output:0:300}"
+        return 1
+    fi
+
+    if ! validate_current_config_schema; then
+        cp "$CONFIG_FILE" "$CONFIG_FILE.bad-proxy-repair.$TIMESTAMP"
+        cp "$BACKUP_DIR/openclaw.json.pre-proxy-repair.$TIMESTAMP" "$CONFIG_FILE"
+        log "[ERROR] Global proxy repair failed schema validation; restored previous config"
+        return 1
+    fi
+
+    log "[RECOVERED] Global proxy aligned with Discord proxy ($desired)"
+    RECOVERED=$((RECOVERED + 1))
+    request_restart "Global proxy aligned with Discord proxy"
+    wait_for_gateway_startup "global proxy alignment"
+    return 0
+}
+
+repair_cron_discord_delivery_accounts() {
+    if [[ ! -f "$CRON_FILE" ]] || [[ ! -f "$CONFIG_FILE" ]]; then
+        return 0
+    fi
+
+    local changes status
+    changes=$("$PYTHON" - "$CONFIG_FILE" "$CRON_FILE" check <<'PY' 2>/dev/null
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+cron_path = Path(sys.argv[2])
+mode = sys.argv[3]
+
+config = json.loads(config_path.read_text(encoding="utf-8"))
+cron = json.loads(cron_path.read_text(encoding="utf-8"))
+
+discord = config.get("channels", {}).get("discord", {})
+valid_accounts = set((discord.get("accounts") or {}).keys())
+if not valid_accounts:
+    print("NO_DISCORD_ACCOUNTS")
+    sys.exit(0)
+
+default_account = discord.get("defaultAccountId")
+if default_account not in valid_accounts:
+    default_account = "default" if "default" in valid_accounts else sorted(valid_accounts)[0]
+
+def is_discord_delivery(d):
+    if not isinstance(d, dict):
+        return False
+    target = str(d.get("to") or "")
+    return (
+        d.get("channel") == "discord"
+        or target.startswith("user:")
+        or target.startswith("channel:")
+    )
+
+changes = []
+for job in cron.get("jobs", []):
+    for key in ("delivery", "failureAlert"):
+        delivery = job.get(key)
+        if not is_discord_delivery(delivery):
+            continue
+        account = delivery.get("accountId")
+        if account and account not in valid_accounts:
+            changes.append(f"{job.get('id') or job.get('name')}:{key}:{account}->{default_account}")
+            if mode == "repair":
+                delivery["accountId"] = default_account
+
+if not changes:
+    print("OK")
+    sys.exit(0)
+
+if mode == "repair":
+    cron_path.write_text(json.dumps(cron, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+print("\n".join(changes))
+sys.exit(2)
+PY
+)
+    status=$?
+
+    if [[ $status -eq 0 ]]; then
+        log "[OK] Discord cron delivery accountIds are valid"
+        return 0
+    fi
+    if [[ $status -ne 2 ]]; then
+        log "[ERROR] Unable to audit Discord cron delivery accountIds"
+        return 1
+    fi
+
+    log "[WARN] Invalid Discord cron delivery accountIds detected: $(echo "$changes" | tr '\n' '; ')"
+    if $DRY_RUN; then
+        log "[DRY-RUN] Would repair invalid Discord cron delivery accountIds"
+        return 0
+    fi
+
+    cp "$CRON_FILE" "$BACKUP_DIR/jobs.json.pre-delivery-account-repair.$TIMESTAMP"
+
+    local repair_output
+    if ! repair_output=$("$PYTHON" - "$CONFIG_FILE" "$CRON_FILE" repair <<'PY' 2>&1
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+cron_path = Path(sys.argv[2])
+mode = sys.argv[3]
+
+config = json.loads(config_path.read_text(encoding="utf-8"))
+cron = json.loads(cron_path.read_text(encoding="utf-8"))
+
+discord = config.get("channels", {}).get("discord", {})
+valid_accounts = set((discord.get("accounts") or {}).keys())
+if not valid_accounts:
+    print("NO_DISCORD_ACCOUNTS")
+    sys.exit(0)
+
+default_account = discord.get("defaultAccountId")
+if default_account not in valid_accounts:
+    default_account = "default" if "default" in valid_accounts else sorted(valid_accounts)[0]
+
+def is_discord_delivery(d):
+    if not isinstance(d, dict):
+        return False
+    target = str(d.get("to") or "")
+    return (
+        d.get("channel") == "discord"
+        or target.startswith("user:")
+        or target.startswith("channel:")
+    )
+
+changes = []
+for job in cron.get("jobs", []):
+    for key in ("delivery", "failureAlert"):
+        delivery = job.get(key)
+        if not is_discord_delivery(delivery):
+            continue
+        account = delivery.get("accountId")
+        if account and account not in valid_accounts:
+            changes.append(f"{job.get('id') or job.get('name')}:{key}:{account}->{default_account}")
+            if mode == "repair":
+                delivery["accountId"] = default_account
+
+if mode == "repair" and changes:
+    cron_path.write_text(json.dumps(cron, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+print("\n".join(changes) if changes else "OK")
+sys.exit(0)
+PY
+); then
+        log "[ERROR] Failed to repair Discord cron delivery accountIds: ${repair_output:0:300}"
+        return 1
+    fi
+
+    if ! "$PYTHON" -c "import json; json.load(open('$CRON_FILE'))" 2>/dev/null; then
+        cp "$CRON_FILE" "$CRON_FILE.bad-delivery-account-repair.$TIMESTAMP"
+        cp "$BACKUP_DIR/jobs.json.pre-delivery-account-repair.$TIMESTAMP" "$CRON_FILE"
+        log "[ERROR] Cron delivery account repair produced invalid JSON; restored previous jobs.json"
+        return 1
+    fi
+
+    log "[RECOVERED] Repaired Discord cron delivery accountIds: $(echo "$repair_output" | tr '\n' '; ')"
+    RECOVERED=$((RECOVERED + 1))
+    return 0
 }
 
 
@@ -1195,6 +1435,17 @@ if [[ $CONFIG_VALID -eq 1 ]]; then
 
     if [[ "$GATEWAY_PORT_CFG" != "18789" ]] && [[ -n "$GATEWAY_PORT_CFG" ]]; then
         log "[WARN] Gateway port changed: $GATEWAY_PORT_CFG (expected 18789)"
+    fi
+
+    if ! repair_global_proxy_alignment; then
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+# ─── Step 6.5: cron 投递账号闭环检查 ───
+if [[ $CRON_VALID -eq 1 ]] && [[ $CONFIG_VALID -eq 1 ]]; then
+    if ! repair_cron_discord_delivery_accounts; then
+        ERRORS=$((ERRORS + 1))
     fi
 fi
 

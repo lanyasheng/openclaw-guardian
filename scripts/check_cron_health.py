@@ -12,6 +12,9 @@ TODAY_START_MS = int(TODAY_START.timestamp() * 1000)
 CRITICAL_JOBS = [
     "ainews-morning-digest", "ainews-paper-digest", "ainews-evening-report",
     "daily-reflection-ainews",
+    "autoresearch-ainews-generate", "autoresearch-daily-review",
+    "autoresearch-check-decisions", "autoresearch-experiment-evaluator",
+    "autoresearch-experiment-launcher",
     "trading-morning-brief", "trading-opening-bell", "trading-closing-summary",
     "daily-reflection-trading",
     "macro-daily-check", "finance-news-evening",
@@ -21,8 +24,16 @@ CRITICAL_JOBS = [
 with open("/Users/study/.openclaw/cron/jobs.json") as f:
     data = json.load(f)
 
+with open("/Users/study/.openclaw/openclaw.json") as f:
+    config = json.load(f)
+
+valid_discord_accounts = set(
+    config.get("channels", {}).get("discord", {}).get("accounts", {}).keys()
+)
+
 failed = []
 missed = []
+invalid_delivery = []
 ok_count = 0
 checked = 0
 
@@ -30,11 +41,26 @@ for j in data.get("jobs", []):
     if not j.get("enabled"):
         continue
     name = j.get("name", "")
+    jid = j.get("id", "?")
+
+    delivery = j.get("delivery", {})
+    if isinstance(delivery, dict):
+        target = str(delivery.get("to") or "")
+        is_discord_delivery = (
+            delivery.get("channel") == "discord"
+            or target.startswith("user:")
+            or target.startswith("channel:")
+        )
+        account = delivery.get("accountId")
+        if is_discord_delivery and account and account not in valid_discord_accounts:
+            invalid_delivery.append(
+                f"{name} (ID: {jid}): invalid Discord accountId={account}"
+            )
+
     if name not in CRITICAL_JOBS:
         continue
 
     checked += 1
-    jid = j.get("id", "?")
     state = j.get("state", {})
     last_run = state.get("lastRunAtMs", 0)
     status = state.get("lastRunStatus", "?")
@@ -71,7 +97,12 @@ if missed:
     for m in missed:
         print(f"  RETRY: {m}")
 
-if not failed and not missed:
+if invalid_delivery:
+    print("\nINVALID DELIVERY CONFIG:")
+    for item in invalid_delivery:
+        print(f"  FIX: {item}")
+
+if not failed and not missed and not invalid_delivery:
     print("\nALL CRITICAL TASKS HEALTHY")
 
 # Chrome CDP health check
